@@ -3,10 +3,36 @@
 use std::mem::size_of;
 use std::ptr;
 
-use crate::arena::{try_alloc_aligned, LOCAL_END, LOCAL_OFFSET, LOCAL_START};
+use crate::arena::{try_alloc_aligned, Arena, ARENA};
 use crate::heap::{alloc_aligned_global, alloc_global, fetch_chunk};
 use crate::CHUNK_SIZE;
 
+/// Slow path for malloc - handles chunk allocation and large allocations
+#[cold]
+#[inline(never)]
+unsafe fn malloc_slow(arena: *mut Arena, size: usize, total: usize) -> *mut u8 {
+    // Large allocations go directly to global heap
+    if total > CHUNK_SIZE / 2 {
+        return alloc_global(total, size);
+    }
+
+    // Need a new chunk
+    match fetch_chunk(CHUNK_SIZE) {
+        Some((start, chunk_size)) => unsafe {
+            (*arena).start = start;
+            (*arena).offset = 0;
+            (*arena).end = chunk_size;
+        },
+        None => return ptr::null_mut(),
+    }
+
+    unsafe {
+        let block = (*arena).start;
+        (*arena).offset = total;
+        ptr::write(block as *mut u64, size as u64);
+        block.add(8)
+    }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn malloc(size: usize) -> *mut u8 {
@@ -17,30 +43,19 @@ pub extern "C" fn malloc(size: usize) -> *mut u8 {
     // size + 8 for header, aligned to 8 bytes
     let total = (size + 8 + 7) & !7;
 
-    // Large allocations go directly to global heap
-    if total > CHUNK_SIZE / 2 {
-        return alloc_global(total, size);
-    }
-
     unsafe {
-        let remaining = LOCAL_END.saturating_sub(LOCAL_OFFSET);
+        let arena = &raw mut ARENA;
+        let new_offset = (*arena).offset + total;
 
-        // Need a new chunk?
-        if remaining < total {
-            match fetch_chunk(CHUNK_SIZE) {
-                Some((start, chunk_size)) => {
-                    LOCAL_START = start;
-                    LOCAL_OFFSET = 0;
-                    LOCAL_END = chunk_size;
-                }
-                None => return ptr::null_mut(),
-            }
+        // Fast path: fits in current chunk
+        if total <= CHUNK_SIZE / 2 && new_offset <= (*arena).end {
+            let block = (*arena).start.add((*arena).offset);
+            (*arena).offset = new_offset;
+            ptr::write(block as *mut u64, size as u64);
+            block.add(8)
+        } else {
+            malloc_slow(arena, size, total)
         }
-
-        let block = LOCAL_START.add(LOCAL_OFFSET);
-        ptr::write(block as *mut u64, size as u64);
-        LOCAL_OFFSET += total;
-        block.add(8)
     }
 }
 
@@ -82,13 +97,14 @@ pub extern "C" fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
 
     // Check if this is the last allocation in thread-local arena (can extend)
     unsafe {
+        let arena = &raw mut ARENA;
         let block_start = ptr.sub(8);
-        let block_end_offset = block_start.offset_from(LOCAL_START) as usize + 8 + ((old_size + 7) & !7);
+        let block_end_offset = block_start.offset_from((*arena).start) as usize + 8 + ((old_size + 7) & !7);
 
-        if block_start >= LOCAL_START && block_end_offset == LOCAL_OFFSET {
+        if block_start >= (*arena).start && block_end_offset == (*arena).offset {
             let additional = ((size + 7) & !7) - ((old_size + 7) & !7);
-            if LOCAL_OFFSET + additional <= LOCAL_END {
-                LOCAL_OFFSET += additional;
+            if (*arena).offset + additional <= (*arena).end {
+                (*arena).offset += additional;
                 ptr::write((ptr as *mut u64).sub(1), size as u64);
                 return ptr;
             }
@@ -120,22 +136,24 @@ pub extern "C" fn memalign(alignment: usize, size: usize) -> *mut u8 {
     }
 
     unsafe {
+        let arena = &raw mut ARENA;
+
         // Try current arena first
-        if let Some(ptr) = try_alloc_aligned(alignment, size) {
+        if let Some(ptr) = try_alloc_aligned(arena, alignment, size) {
             return ptr;
         }
 
         // Need a new chunk
         match fetch_chunk(CHUNK_SIZE) {
             Some((start, chunk_size)) => {
-                LOCAL_START = start;
-                LOCAL_OFFSET = 0;
-                LOCAL_END = chunk_size;
+                (*arena).start = start;
+                (*arena).offset = 0;
+                (*arena).end = chunk_size;
             }
             None => return ptr::null_mut(),
         }
 
-        try_alloc_aligned(alignment, size).unwrap_or(ptr::null_mut())
+        try_alloc_aligned(arena, alignment, size).unwrap_or(ptr::null_mut())
     }
 }
 
