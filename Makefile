@@ -5,7 +5,7 @@ SO = target/release/libleak_alloc.so
 all: build
 
 build:
-	cargo build --release
+	cargo +nightly build --release
 
 test: build test.c
 	gcc -o test test.c
@@ -20,5 +20,5 @@ bench: build bench.c
 	LD_PRELOAD=$(SO) ./bench
 
 clean:
-	cargo clean
+	cargo +nightly clean
 	rm -f test bench
